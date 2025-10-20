@@ -32,6 +32,7 @@ async function loadModel() {
     const arrayBuf = await blob.arrayBuffer();
     const model = new Uint8Array(arrayBuf);
     session = await ort.InferenceSession.create(model, { executionProviders: ['webgl','wasm'] });
+    console.info('ONNX model loaded, session:', session);
     els.modelStatus.textContent = 'U²‑Netp loaded (CDN)';
   } catch (e) {
     console.warn('ONNX model failed, fallback (people only).', e);
@@ -131,15 +132,27 @@ function refineAlpha(alpha, w, h, threshold=10, feather=2) {
 }
 async function runU2Net(img) {
   const input = makeTensorFromImage(img, 320);
-  const results = await session.run({ 'input': input });
-  const first = Object.values(results)[0];
-  const arr = first.data;
-  const len = first.dims[2]*first.dims[3];
-  const out = new Float32Array(len);
-  let min=+1e9, max=-1e9;
-  for (let i=0; i<len; i++){ const v = arr[i]; if (v<min) min=v; if (v>max) max=v; }
-  for (let i=0; i<len; i++){ out[i] = ((arr[i]-min)/(max-min+1e-6))*255; }
-  return out;
+  try {
+    // Build feeds using the model's first input name (safer than hardcoding 'input')
+    const feeds = {};
+    const inputName = (session && (session.inputNames && session.inputNames[0])) || 'input';
+    feeds[inputName] = input;
+    const results = await session.run(feeds);
+    const first = Object.values(results)[0];
+    const arr = first.data || first;
+    const dims = first.dims || [1,1,320,320];
+    const len = (dims[2] || 320) * (dims[3] || 320);
+    const out = new Float32Array(len);
+    let min = Number.POSITIVE_INFINITY, max = Number.NEGATIVE_INFINITY;
+    for (let i = 0; i < len; i++) { const v = arr[i]; if (v < min) min = v; if (v > max) max = v; }
+    const range = max - min + 1e-6;
+    for (let i = 0; i < len; i++) { out[i] = ((arr[i] - min) / range) * 255; }
+    return out;
+  } catch (err) {
+    console.error('runU2Net failed, falling back to selfie segmentation', err);
+    // rethrow so caller can catch and switch to fallback, or return null
+    throw err;
+  }
 }
 async function selfieSegFallback(img) {
   return new Promise((resolve)=>{
@@ -184,8 +197,16 @@ async function processImage() {
   const {w,h} = drawToCanvas(originalImageBitmap);
   els.modelStatus.textContent = 'Processing…';
   try {
-    const alpha320 = session ? await runU2Net(originalImageBitmap)
-                             : await selfieSegFallback(originalImageBitmap);
+    let alpha320;
+    if (session) {
+      els.modelStatus.textContent = 'Processing (U²‑Netp)…';
+      alpha320 = await runU2Net(originalImageBitmap);
+      console.info('Processed with U2Netp');
+    } else {
+      els.modelStatus.textContent = 'Processing (fallback)…';
+      alpha320 = await selfieSegFallback(originalImageBitmap);
+      console.info('Processed with selfie segmentation fallback');
+    }
     composite(originalImageBitmap, alpha320, w, h);
     els.modelStatus.textContent = session ? 'Done (U²‑Netp)' : 'Done (fallback: people only)';
   } catch (e) {
