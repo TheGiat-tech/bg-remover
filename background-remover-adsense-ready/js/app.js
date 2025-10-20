@@ -110,25 +110,110 @@ function bilinearResizeGray(src, srcW, srcH, dstW, dstH) {
   }
   return out;
 }
-function refineAlpha(alpha, w, h, threshold=10, feather=2) {
-  const out = new Uint8ClampedArray(w*h);
-  for (let i=0; i<w*h; i++) out[i] = Math.max(0, Math.min(255, alpha[i]));
-  if (threshold>0) for (let i=0; i<w*h; i++) out[i] = out[i] > threshold ? out[i] : 0;
-  if (feather>0) {
-    const rad = feather|0, tmp = new Uint8ClampedArray(out);
-    for (let y=0; y<h; y++) for (let x=0; x<w; x++) {
-      let sum=0, cnt=0;
-      for (let dy=-rad; dy<=rad; dy++) {
-        const yy = y+dy; if (yy<0||yy>=h) continue;
-        for (let dx=-rad; dx<=rad; dx++) {
-          const xx = x+dx; if (xx<0||xx>=w) continue;
-          sum += tmp[yy*w+xx]; cnt++;
-        }
-      }
-      out[y*w+x] = (sum/cnt)|0;
+
+// Fast box filter via integral image
+function boxFilter(src, w, h, r) {
+  const iw = w + 1;
+  const integral = new Float64Array(iw * (h + 1));
+  for (let y = 0; y < h; y++) {
+    let rowSum = 0;
+    for (let x = 0; x < w; x++) {
+      rowSum += src[y * w + x];
+      integral[(y + 1) * iw + (x + 1)] = integral[y * iw + (x + 1)] + rowSum;
+    }
+  }
+  const out = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const y0 = Math.max(0, y - r);
+    const y1 = Math.min(h - 1, y + r);
+    for (let x = 0; x < w; x++) {
+      const x0 = Math.max(0, x - r);
+      const x1 = Math.min(w - 1, x + r);
+      const A = integral[y0 * iw + x0];
+      const B = integral[y0 * iw + (x1 + 1)];
+      const C = integral[(y1 + 1) * iw + x0];
+      const D = integral[(y1 + 1) * iw + (x1 + 1)];
+      const area = (y1 - y0 + 1) * (x1 - x0 + 1);
+      out[y * w + x] = (D - B - C + A) / area;
     }
   }
   return out;
+}
+
+// Guided filter for edge-aware smoothing (single-channel guidance derived from RGB)
+function guidedFilter(guideRGBA, gw, gh, p, r = 4, eps = 1e-3) {
+  const N = gw * gh;
+  const I = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    const gi = i * 4;
+    const rc = guideRGBA[gi] / 255;
+    const gc = guideRGBA[gi + 1] / 255;
+    const bc = guideRGBA[gi + 2] / 255;
+    I[i] = 0.299 * rc + 0.587 * gc + 0.114 * bc;
+  }
+  const P = new Float32Array(N);
+  for (let i = 0; i < N; i++) P[i] = Math.max(0, Math.min(1, p[i] / 255));
+
+  const meanI = boxFilter(I, gw, gh, r);
+  const meanP = boxFilter(P, gw, gh, r);
+  const Ip = new Float32Array(N); for (let i = 0; i < N; i++) Ip[i] = I[i] * P[i];
+  const meanIp = boxFilter(Ip, gw, gh, r);
+  const covIp = new Float32Array(N); for (let i = 0; i < N; i++) covIp[i] = meanIp[i] - meanI[i] * meanP[i];
+
+  const II = new Float32Array(N); for (let i = 0; i < N; i++) II[i] = I[i] * I[i];
+  const meanII = boxFilter(II, gw, gh, r);
+  const varI = new Float32Array(N); for (let i = 0; i < N; i++) varI[i] = meanII[i] - meanI[i] * meanI[i];
+
+  const a = new Float32Array(N); const b = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    a[i] = covIp[i] / (varI[i] + eps);
+    b[i] = meanP[i] - a[i] * meanI[i];
+  }
+
+  const meanA = boxFilter(a, gw, gh, r);
+  const meanB = boxFilter(b, gw, gh, r);
+
+  const q = new Uint8ClampedArray(N);
+  for (let i = 0; i < N; i++) {
+    const v = meanA[i] * I[i] + meanB[i];
+    q[i] = Math.max(0, Math.min(255, Math.round(v * 255)));
+  }
+  return q;
+}
+function refineAlpha(alpha, w, h, threshold = 10, feather = 2) {
+  const clamped = new Uint8ClampedArray(w * h);
+  for (let i = 0; i < w * h; i++) clamped[i] = Math.max(0, Math.min(255, Math.round(alpha[i])));
+  if (threshold > 0) for (let i = 0; i < clamped.length; i++) clamped[i] = clamped[i] > threshold ? clamped[i] : 0;
+
+  if (!feather || feather <= 0) return clamped;
+
+  try {
+    // draw current display to a guide canvas at required size
+    const guide = document.createElement('canvas');
+    guide.width = w; guide.height = h;
+    const gctx = guide.getContext('2d');
+    gctx.drawImage(els.display, 0, 0, w, h);
+    const guideRGBA = gctx.getImageData(0, 0, w, h).data;
+    const radius = Math.max(1, feather | 0);
+    const eps = 1e-3;
+    return guidedFilter(guideRGBA, w, h, clamped, radius, eps);
+  } catch (err) {
+    console.warn('guidedFilter failed, falling back to box blur', err);
+    const out = clamped.slice();
+    const rad = feather | 0;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      let sum = 0, cnt = 0;
+      for (let dy = -rad; dy <= rad; dy++) {
+        const yy = y + dy; if (yy < 0 || yy >= h) continue;
+        for (let dx = -rad; dx <= rad; dx++) {
+          const xx = x + dx; if (xx < 0 || xx >= w) continue;
+          sum += clamped[yy * w + xx]; cnt++;
+        }
+      }
+      out[y * w + x] = cnt ? (sum / cnt) | 0 : out[y * w + x];
+    }
+    return out;
+  }
 }
 async function runU2Net(img) {
   const input = makeTensorFromImage(img, 320);
