@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "builds": [
+    { "src": "background-remover-adsense-ready/**", "use": "@vercel/static" }
+  ],
+  "routes": [
+    { "src": "^/assets/(.*)$", "dest": "/background-remover-adsense-ready/assets/$1" },
+    { "src": "^/css/(.*)$", "dest": "/background-remover-adsense-ready/css/$1" },
+    { "src": "^/js/(.*)$", "dest": "/background-remover-adsense-ready/js/$1" },
+    { "src": "^/$", "dest": "/background-remover-adsense-ready/index.html" },
+    { "src": "^/(.*)$", "dest": "/background-remover-adsense-ready/$1" }
+  ]
+}
