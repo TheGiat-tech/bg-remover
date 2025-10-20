@@ -28,6 +28,12 @@
 <link rel="canonical" href="https://YOUR-SITE-DOMAIN/" />
 </head>
 <body>
+  <div id="statusbar" aria-hidden="false">
+    <div id="status-text">Idle</div>
+    <div id="progress" aria-hidden="true"><div id="progress-fill" style="width:0%"></div></div>
+    <button id="toggle-log" aria-expanded="false" aria-controls="log-panel">Logs</button>
+  </div>
+  <div id="log-panel" hidden aria-live="polite"></div>
 <header class="header">
       <svg class="logo" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
       <defs><linearGradient id="g" x1="0" x2="1"><stop offset="0" stop-color="#6ee7f9"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs>
@@ -72,35 +78,26 @@
     </div>
   </section>
 
-  <section class="controls" id="controls" style="display:none">
+  <!-- Minimal zero-control UI -->
+  <section class="controls" id="controls">
     <div class="row">
-      <label>Background:</label>
-      <button id="bgTransparent" class="chip selected">Transparent</button>
-      <button id="bgWhite" class="chip">White</button>
-      <input id="bgColor" type="color" value="#00ffffff" />
+      <button id="downloadBtn" disabled>Download PNG</button>
+      <button id="replaceBtn" class="ghost">Replace image</button>
     </div>
-    <div class="row">
-      <label>Refine:</label>
-      <div class="slider">
-        <input id="thresh" type="range" min="0" max="255" value="10"/>
-        <span>Alpha threshold</span>
-      </div>
-      <div class="slider">
-        <input id="feather" type="range" min="0" max="10" value="2"/>
-        <span>Feather</span>
-      </div>
-    </div>
-    <div class="row">
-      <button id="downloadBtn">Download PNG</button>
-      <button id="resetBtn" class="ghost">Reset</button>
-    </div>
+    <details style="margin-top:.75rem"><summary>Advanced</summary>
+      <label style="display:block;margin-top:.5rem"><input id="useFallback" type="checkbox"/> Use MediaPipe fallback</label>
+    </details>
   </section>
 
-  <section class="canvas-wrap" id="canvasWrap" style="display:none">
-    <canvas id="displayCanvas"></canvas>
+  <section class="canvas-wrap" id="canvasWrap">
+    <div class="preview" id="resultPreview">
+      <canvas id="displayCanvas" aria-label="Result canvas"></canvas>
+      <div id="spinner" class="spinner" style="display:none">Processing…</div>
+    </div>
   </section>
 
   <section class="status">Model: <span id="modelStatus">Loading…</span></section>
+  <section class="status">Status: <span id="status"></span></section>
 
   <div class="ad-box">
     <ins class="adsbygoogle"
@@ -119,6 +116,6 @@
 <script src="https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js"></script>
 <script src="/js/banner.js"></script>
 
-<script src="/js/app.js"></script>
+<script type="module" src="/js/app.js"></script>
 </body>
 </html>

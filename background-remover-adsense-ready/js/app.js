@@ -1,330 +1,506 @@
 
-// ONNX + Fallback (client-only)
-const MODEL_URL = 'https://huggingface.co/chwshuang/Stable_diffusion_remove_background_model/resolve/06d038aa68503bfc2ba4d4ce4a81ef8b768995b9/u2netp.onnx?download=true';
+/* Zero-control auto-run pipeline
+   - exposes window.runAuto(file)
+   - auto-processes file on drop/select
+   - lightweight utilities: otsuThreshold, adaptiveFeather, deSpill
+*/
+import { ModelWorkerClient } from './modelWorkerClient.js';
+
+const MODEL_URL = '/models/u2net.onnx';
+const MODEL_URL_P = '/models/u2netp.onnx';
+// prefer the lightweight U2‑NetP shipped with the site (fast, client-friendly)
+const modelPath = "/models/u2netp.onnx";
+console.log('Model path:', modelPath);
+
 const els = {
   drop: document.getElementById('dropzone'),
   file: document.getElementById('fileInput'),
-  browse: document.getElementById('browseBtn'),
-  display: document.getElementById('displayCanvas'),
+  displayCanvas: document.getElementById('displayCanvas'),
   controls: document.getElementById('controls'),
-  canvasWrap: document.getElementById('canvasWrap'),
-  modelStatus: document.getElementById('modelStatus'),
+  resultPreview: document.getElementById('resultPreview'),
   download: document.getElementById('downloadBtn'),
-  reset: document.getElementById('resetBtn'),
-  bgTransparent: document.getElementById('bgTransparent'),
-  bgWhite: document.getElementById('bgWhite'),
-  bgColor: document.getElementById('bgColor'),
-  thresh: document.getElementById('thresh'),
-  feather: document.getElementById('feather')
+  replace: document.getElementById('replaceBtn'),
+  spinner: document.getElementById('spinner'),
+  useFallback: document.getElementById('useFallback')
 };
-let session = null;
-let originalImageBitmap = null;
 
-async function fetchModelAsBlob(url){
+let session = null; // ONNX session placeholder (worker handles inference)
+let mw = null; // ModelWorkerClient
+let currentFile = null;
+
+// --- Status / Log API --------------------------------------------------
+const statusEls = {
+  bar: document.getElementById('statusbar'),
+  text: document.getElementById('status-text'),
+  progressFill: document.getElementById('progress-fill'),
+  toggleLog: document.getElementById('toggle-log'),
+  logPanel: document.getElementById('log-panel')
+};
+let logLines = [];
+function timeNow(){ const d=new Date(); return d.toLocaleTimeString(); }
+function appendLog(msg){ const ts = timeNow(); const line = `${ts} ${msg}`; logLines.push(line); if (logLines.length>200) logLines.shift(); if (statusEls.logPanel){ const div=document.createElement('div'); div.className='log-line'; div.textContent=line; statusEls.logPanel.appendChild(div); statusEls.logPanel.scrollTop = statusEls.logPanel.scrollHeight; }
+  try{ console.log(line); }catch(_){}
+}
+function setProgress(pct){ pct = Math.max(0, Math.min(100, Math.round(pct))); if (statusEls.progressFill) statusEls.progressFill.style.width = pct+'%'; }
+function setStatus(txt){ if (statusEls.text) statusEls.text.textContent = txt; }
+function addStatus(step){ appendLog(step); setStatus(step); }
+
+// log panel toggle
+if (statusEls.toggleLog){ statusEls.toggleLog.addEventListener('click', ()=>{ const lp=statusEls.logPanel; if (!lp) return; const isHidden = lp.hasAttribute('hidden'); if (isHidden){ lp.removeAttribute('hidden'); statusEls.toggleLog.setAttribute('aria-expanded','true'); statusEls.toggleLog.textContent = 'Hide Logs'; } else { lp.setAttribute('hidden',''); statusEls.toggleLog.setAttribute('aria-expanded','false'); statusEls.toggleLog.textContent = 'Logs'; } }); }
+
+function showSpinner(){ if (els.spinner) els.spinner.style.display = 'block'; }
+function hideSpinner(){ if (els.spinner) els.spinner.style.display = 'none'; }
+function showToast(msg, timeout=2000){
+  let t = document.querySelector('.toast');
+  if (!t){ t = document.createElement('div'); t.className='toast'; document.body.appendChild(t); }
+  t.textContent = msg; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'), timeout);
+}
+
+async function fetchModel(url){
   const res = await fetch(url, { mode: 'cors' });
-  if (!res.ok) throw new Error('Failed to fetch model: '+res.status);
-  return await res.blob();
+  if (!res.ok) throw new Error('model fetch failed '+res.status);
+  const ab = await res.arrayBuffer();
+  return ab;
 }
 
-async function loadModel() {
-  try {
-    const blob = await fetchModelAsBlob(MODEL_URL);
-    const arrayBuf = await blob.arrayBuffer();
-    const model = new Uint8Array(arrayBuf);
-    session = await ort.InferenceSession.create(model, { executionProviders: ['webgl','wasm'] });
-    console.info('ONNX model loaded, session:', session);
-    els.modelStatus.textContent = 'U²‑Netp loaded (CDN)';
-  } catch (e) {
-    console.warn('ONNX model failed, fallback (people only).', e);
-    els.modelStatus.textContent = 'Model failed. Using fallback (people only)';
-    session = null;
+async function loadModel(name) {
+  // load model bytes from ./models/{name}
+  const path = `./models/${name}`;
+  const res = await fetch(path, { mode: 'cors' });
+  if (!res.ok) throw new Error(`fetch ${path} failed ${res.status}`);
+  const ab = await res.arrayBuffer();
+  const bytes = new Uint8Array(ab);
+  const sess = await ort.InferenceSession.create(bytes, { executionProviders: ['wasm','webgl','webgpu'] });
+  window.segModel = sess;
+  session = sess;
+  return sess;
+}
+
+async function loadModelOnce(){
+  if (session) return session;
+  // try main then fallback
+  // initialize worker client
+  if (!mw) mw = new ModelWorkerClient();
+  // wire worker events for status/progress/logs (idempotent)
+  mw.on('log', (m)=>{ appendLog(m); });
+  mw.on('load:start', ({name})=>{ addStatus('Loading model…'); setProgress(10); appendLog('⏳ loading '+name); });
+  mw.on('load:done', ({name})=>{ appendLog('✅ model from IndexedDB or cache: '+name); setProgress(40); });
+  mw.on('load:error', ({name, error})=>{ appendLog('❌ model load failed: '+name+' '+ (error && error.message ? error.message : error)); setStatus('Error ⚠️'); setProgress(0); });
+  mw.on('infer:start', ()=>{ setStatus('Removing background…'); setProgress(90); appendLog('▶️ inference started'); });
+  mw.on('infer:done', ()=>{ appendLog('✅ inference finished'); setProgress(95); });
+  mw.on('infer:error', ({error})=>{ appendLog('❌ inference error: '+(error && error.message? error.message : error)); setStatus('Error ⚠️'); setProgress(0); });
+  // ensure U2‑NetP model is present locally (or cached in IndexedDB)
+  addStatus('Ensuring U2‑NetP model…'); setProgress(15);
+  const bytes = await ensureU2NetpModel();
+  // create ONNX Runtime session (prefer webgl then wasm)
+  try{
+    if (typeof ort !== 'undefined' && ort.env && ort.env.wasm){ ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/"; ort.env.wasm.proxy = true; }
+    const sess = await ort.InferenceSession.create(bytes, { executionProviders: ['webgl','wasm'] });
+    window.segModel = sess; session = sess; appendLog('🧠 session ready (u2netp)'); setProgress(70);
+    return session;
+  }catch(err){
+    appendLog('❌ Failed to create session from u2netp bytes: '+(err && err.message? err.message : err));
+    session = null; throw err;
+  }
+
+// Ensure u2netp.onnx is available locally (/models/u2netp.onnx) or cached in IndexedDB
+async function ensureU2NetpModel(){
+  const mp = modelPath; // keep backward compat
+  try{
+    const response = await fetch(modelPath, { cache: 'force-cache' });
+    if (!response.ok) throw new Error('Missing local model');
+    appendLog('✅ Model found locally.');
+    const arrayBuffer = await response.arrayBuffer();
+    return new Uint8Array(arrayBuffer);
+  }catch(err){
+    appendLog('⬇️ Downloading model from remote (first-run)...');
+    const url = 'https://huggingface.co/onnx-community/U-2-Net/resolve/main/u2netp.onnx';
+    const response = await fetch(url);
+    if (!response.ok) throw new Error('remote model fetch failed '+response.status);
+    const blob = await response.blob();
+    const arrayBuffer = await blob.arrayBuffer();
+    try{ await saveModelToIndexedDB('u2netp.onnx', blob); appendLog('✅ Model downloaded and cached in IndexedDB.'); }catch(e){ appendLog('⚠️ failed to cache model: '+(e && e.message? e.message : e)); }
+    return new Uint8Array(arrayBuffer);
   }
 }
 
-function setupDnD() {
-  const dz = els.drop;
-  dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('hover'); });
-  dz.addEventListener('dragleave', () => dz.classList.remove('hover'));
-  dz.addEventListener('drop', e => {
-    e.preventDefault(); dz.classList.remove('hover');
-    const f = e.dataTransfer.files?.[0];
-    if (f) handleFile(f);
-  });
-  els.browse.addEventListener('click', ()=> els.file.click());
-  els.file.addEventListener('change', ()=> {
-    const f = els.file.files?.[0];
-    if (f) handleFile(f);
-  });
-  window.addEventListener('paste', (e)=>{
-    const item = [...e.clipboardData.items].find(i=>i.type.startsWith('image/'));
-    if (item) handleFile(item.getAsFile());
-  });
-}
+// Load model bytes and create an ONNX Runtime session with preferred providers
+async function loadSegModel(){
+  console.log('🔍 Loading model from:', modelPath);
+  setStatus('Loading model…'); setProgress(5);
+  const resp = await fetch(modelPath, { cache: 'force-cache' });
+  if (!resp.ok) throw new Error(`Fetch failed ${resp.status}`);
+  const buf = await resp.arrayBuffer();
+  const bytes = new Uint8Array(buf);
 
-async function handleFile(file) {
-  const blobURL = URL.createObjectURL(file);
-  const img = await createImageBitmap(await (await fetch(blobURL)).blob());
-  URL.revokeObjectURL(blobURL);
-  originalImageBitmap = img;
-  els.controls.style.display = 'block';
-  els.canvasWrap.style.display = 'block';
-  await processImage();
-}
-function drawToCanvas(img) {
-  const canvas = els.display;
-  const ctx = canvas.getContext('2d');
-  const maxW = Math.min(1600, img.width);
-  const scale = Math.min(maxW / img.width, 1);
-  const w = Math.round(img.width * scale);
-  const h = Math.round(img.height * scale);
-  canvas.width = w; canvas.height = h;
-  ctx.drawImage(img, 0, 0, w, h);
-  return {w, h};
-}
-function makeTensorFromImage(img, target=320) {
-  const tmp = document.createElement('canvas');
-  tmp.width = target; tmp.height = target;
-  const tctx = tmp.getContext('2d');
-  tctx.drawImage(img, 0, 0, target, target);
-  const { data } = tctx.getImageData(0, 0, target, target);
-  const chw = new Float32Array(3 * target * target);
-  for (let i=0; i<target*target; i++) {
-    const r = data[i*4] / 255, g = data[i*4 + 1] / 255, b = data[i*4 + 2] / 255;
-    chw[i] = r; chw[i + target*target] = g; chw[i + 2*target*target] = b;
-  }
-  return new ort.Tensor('float32', chw, [1,3,target,target]);
-}
-function bilinearResizeGray(src, srcW, srcH, dstW, dstH) {
-  const out = new Float32Array(dstW*dstH);
-  for (let y=0; y<dstH; y++) {
-    const gy = (y*(srcH-1))/(dstH-1);
-    const y0 = Math.floor(gy), y1 = Math.min(y0+1, srcH-1);
-    const wy = gy - y0;
-    for (let x=0; x<dstW; x++) {
-      const gx = (x*(srcW-1))/(dstW-1);
-      const x0 = Math.floor(gx), x1 = Math.min(x0+1, srcW-1);
-      const wx = gx - x0;
-      const i00 = y0*srcW + x0, i01 = y0*srcW + x1, i10 = y1*srcW + x0, i11 = y1*srcW + x1;
-      out[y*dstW + x] = (1-wy)*((1-wx)*src[i00] + wx*src[i01]) + wy*((1-wx)*src[i10] + wx*src[i11]);
-    }
-  }
-  return out;
-}
-
-// Fast box filter via integral image
-function boxFilter(src, w, h, r) {
-  const iw = w + 1;
-  const integral = new Float64Array(iw * (h + 1));
-  for (let y = 0; y < h; y++) {
-    let rowSum = 0;
-    for (let x = 0; x < w; x++) {
-      rowSum += src[y * w + x];
-      integral[(y + 1) * iw + (x + 1)] = integral[y * iw + (x + 1)] + rowSum;
-    }
-  }
-  const out = new Float32Array(w * h);
-  for (let y = 0; y < h; y++) {
-    const y0 = Math.max(0, y - r);
-    const y1 = Math.min(h - 1, y + r);
-    for (let x = 0; x < w; x++) {
-      const x0 = Math.max(0, x - r);
-      const x1 = Math.min(w - 1, x + r);
-      const A = integral[y0 * iw + x0];
-      const B = integral[y0 * iw + (x1 + 1)];
-      const C = integral[(y1 + 1) * iw + x0];
-      const D = integral[(y1 + 1) * iw + (x1 + 1)];
-      const area = (y1 - y0 + 1) * (x1 - x0 + 1);
-      out[y * w + x] = (D - B - C + A) / area;
-    }
-  }
-  return out;
-}
-
-// Guided filter for edge-aware smoothing (single-channel guidance derived from RGB)
-function guidedFilter(guideRGBA, gw, gh, p, r = 4, eps = 1e-3) {
-  const N = gw * gh;
-  const I = new Float32Array(N);
-  for (let i = 0; i < N; i++) {
-    const gi = i * 4;
-    const rc = guideRGBA[gi] / 255;
-    const gc = guideRGBA[gi + 1] / 255;
-    const bc = guideRGBA[gi + 2] / 255;
-    I[i] = 0.299 * rc + 0.587 * gc + 0.114 * bc;
-  }
-  const P = new Float32Array(N);
-  for (let i = 0; i < N; i++) P[i] = Math.max(0, Math.min(1, p[i] / 255));
-
-  const meanI = boxFilter(I, gw, gh, r);
-  const meanP = boxFilter(P, gw, gh, r);
-  const Ip = new Float32Array(N); for (let i = 0; i < N; i++) Ip[i] = I[i] * P[i];
-  const meanIp = boxFilter(Ip, gw, gh, r);
-  const covIp = new Float32Array(N); for (let i = 0; i < N; i++) covIp[i] = meanIp[i] - meanI[i] * meanP[i];
-
-  const II = new Float32Array(N); for (let i = 0; i < N; i++) II[i] = I[i] * I[i];
-  const meanII = boxFilter(II, gw, gh, r);
-  const varI = new Float32Array(N); for (let i = 0; i < N; i++) varI[i] = meanII[i] - meanI[i] * meanI[i];
-
-  const a = new Float32Array(N); const b = new Float32Array(N);
-  for (let i = 0; i < N; i++) {
-    a[i] = covIp[i] / (varI[i] + eps);
-    b[i] = meanP[i] - a[i] * meanI[i];
-  }
-
-  const meanA = boxFilter(a, gw, gh, r);
-  const meanB = boxFilter(b, gw, gh, r);
-
-  const q = new Uint8ClampedArray(N);
-  for (let i = 0; i < N; i++) {
-    const v = meanA[i] * I[i] + meanB[i];
-    q[i] = Math.max(0, Math.min(255, Math.round(v * 255)));
-  }
-  return q;
-}
-function refineAlpha(alpha, w, h, threshold = 10, feather = 2) {
-  const clamped = new Uint8ClampedArray(w * h);
-  for (let i = 0; i < w * h; i++) clamped[i] = Math.max(0, Math.min(255, Math.round(alpha[i])));
-  if (threshold > 0) for (let i = 0; i < clamped.length; i++) clamped[i] = clamped[i] > threshold ? clamped[i] : 0;
-
-  if (!feather || feather <= 0) return clamped;
-
-  try {
-    // draw current display to a guide canvas at required size
-    const guide = document.createElement('canvas');
-    guide.width = w; guide.height = h;
-    const gctx = guide.getContext('2d');
-    gctx.drawImage(els.display, 0, 0, w, h);
-    const guideRGBA = gctx.getImageData(0, 0, w, h).data;
-    const radius = Math.max(1, feather | 0);
-    const eps = 1e-3;
-    return guidedFilter(guideRGBA, w, h, clamped, radius, eps);
-  } catch (err) {
-    console.warn('guidedFilter failed, falling back to box blur', err);
-    const out = clamped.slice();
-    const rad = feather | 0;
-    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-      let sum = 0, cnt = 0;
-      for (let dy = -rad; dy <= rad; dy++) {
-        const yy = y + dy; if (yy < 0 || yy >= h) continue;
-        for (let dx = -rad; dx <= rad; dx++) {
-          const xx = x + dx; if (xx < 0 || xx >= w) continue;
-          sum += clamped[yy * w + xx]; cnt++;
-        }
+  // prefer WebGL then WASM
+  const tryCreate = async (providers) => {
+    try{
+      if (typeof ort !== 'undefined' && ort.env && ort.env.wasm){
+        ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/";
+        ort.env.wasm.proxy = true;
       }
-      out[y * w + x] = cnt ? (sum / cnt) | 0 : out[y * w + x];
+      console.log('🧠 Creating ORT session with providers:', providers);
+      const s = await ort.InferenceSession.create(bytes, { executionProviders: providers });
+      return s;
+    }catch(e){ throw e; }
+  };
+
+  let sess = null;
+  try{
+    sess = await tryCreate(['webgl','wasm']);
+  }catch(e1){
+    console.warn('WebGL+WASM failed, trying WASM only:', e1);
+    sess = await tryCreate(['wasm']);
+  }
+  console.log('✅ ONNX session ready', 'inputs:', sess.inputNames, 'outputs:', sess.outputNames);
+  setStatus('Model loaded ✓'); setProgress(60);
+  window.segModel = sess; session = sess;
+  return sess;
+}
+
+// Run segmentation using actual input/output names from the session
+async function runSegmentation(sess, imageBitmap){
+  // prepare tensor from ImageBitmap
+  const inp = makeInputTensorFromImageBitmap(imageBitmap, 320); // { data, dims }
+  const tensor = new ort.Tensor('float32', inp.data, inp.dims);
+  const inputName = sess.inputNames[0];
+  const outputName = sess.outputNames[0];
+  const results = await sess.run({ [inputName]: tensor });
+  const out = results[outputName];
+  // out.data is Float32Array likely shape [1,1,320,320] or [1,320,320]
+  // flatten to single-channel float array
+  let arr = out.data;
+  if (arr instanceof Float32Array === false) arr = new Float32Array(arr);
+  // normalize to 0..255 if necessary (assume arr values 0..1 or 0..255)
+  // create Float32Array of length 320*320
+  const len = arr.length;
+  const outF = new Float32Array(len);
+  // detect range
+  let min=Infinity, max=-Infinity; for (let i=0;i<len;i++){ const v=arr[i]; if (v<min) min=v; if (v>max) max=v; }
+  const range = (max - min) || 1;
+  for (let i=0;i<len;i++) outF[i] = (arr[i]-min)/range * 255.0;
+  return { data: outF, width: inp.dims[2] || 320, height: inp.dims[3] || 320 };
+}
+
+async function saveModelToIndexedDB(name, blob){
+  return new Promise((resolve, reject)=>{
+    const request = indexedDB.open('modelsDB', 1);
+    request.onupgradeneeded = e => { const db = e.target.result; if (!db.objectStoreNames.contains('models')) db.createObjectStore('models'); };
+    request.onsuccess = e => {
+      const db = e.target.result;
+      const tx = db.transaction('models', 'readwrite');
+      tx.objectStore('models').put(blob, name);
+      tx.oncomplete = ()=> resolve(true);
+      tx.onerror = (ev)=> reject(ev && ev.target && ev.target.error ? ev.target.error : new Error('idb-put-failed'));
+    };
+    request.onerror = (ev)=> reject(ev && ev.target && ev.target.error ? ev.target.error : new Error('idb-open-failed'));
+  });
+}
+
+function bilinearResizeGray(src, srcW, srcH, dstW, dstH){
+  const out = new Float32Array(dstW*dstH);
+  for (let y=0;y<dstH;y++){ const gy = (y*(srcH-1))/(dstH-1); const y0=Math.floor(gy), y1=Math.min(y0+1, srcH-1); const wy=gy-y0;
+    for (let x=0;x<dstW;x++){ const gx=(x*(srcW-1))/(dstW-1); const x0=Math.floor(gx), x1=Math.min(x0+1, srcW-1); const wx=gx-x0;
+      const i00=y0*srcW+x0, i01=y0*srcW+x1, i10=y1*srcW+x0, i11=y1*srcW+x1;
+      out[y*dstW+x] = (1-wy)*((1-wx)*src[i00]+wx*src[i01]) + wy*((1-wx)*src[i10]+wx*src[i11]);
+  }}
+  return out;
+}
+
+// Guided filter helpers (fast JS implementation for gray guidance)
+function _integralImage(src, w, h){
+  const S = new Float64Array((w+1)*(h+1));
+  for (let y=0;y<h;y++){
+    let rowSum = 0;
+    for (let x=0;x<w;x++){
+      rowSum += src[y*w + x];
+      S[(y+1)*(w+1) + (x+1)] = S[y*(w+1) + (x+1)] + rowSum;
     }
-    return out;
   }
+  return S;
 }
-async function runU2Net(img) {
-  const input = makeTensorFromImage(img, 320);
-  try {
-    // Build feeds using the model's first input name (safer than hardcoding 'input')
-    const feeds = {};
-    const inputName = (session && (session.inputNames && session.inputNames[0])) || 'input';
-    feeds[inputName] = input;
-    const results = await session.run(feeds);
-    const first = Object.values(results)[0];
-    const arr = first.data || first;
-    const dims = first.dims || [1,1,320,320];
-    const len = (dims[2] || 320) * (dims[3] || 320);
-    const out = new Float32Array(len);
-    let min = Number.POSITIVE_INFINITY, max = Number.NEGATIVE_INFINITY;
-    for (let i = 0; i < len; i++) { const v = arr[i]; if (v < min) min = v; if (v > max) max = v; }
-    const range = max - min + 1e-6;
-    for (let i = 0; i < len; i++) { out[i] = ((arr[i] - min) / range) * 255; }
-    return out;
-  } catch (err) {
-    console.error('runU2Net failed, falling back to selfie segmentation', err);
-    // rethrow so caller can catch and switch to fallback, or return null
-    throw err;
+function _boxSum(S, x0,y0,x1,y1, w){
+  const W = w+1;
+  return S[(y1+1)*W + (x1+1)] - S[(y0)*W + (x1+1)] - S[(y1+1)*W + (x0)] + S[(y0)*W + (x0)];
+}
+function _boxFilter(arr, w, h, r){
+  const S = _integralImage(arr, w, h);
+  const out = new Float32Array(w*h);
+  for (let y=0;y<h;y++){
+    const y0 = Math.max(0, y - r), y1 = Math.min(h-1, y + r);
+    for (let x=0;x<w;x++){
+      const x0 = Math.max(0, x - r), x1 = Math.min(w-1, x + r);
+      const area = (y1 - y0 + 1) * (x1 - x0 + 1);
+      out[y*w + x] = _boxSum(S, x0,y0,x1,y1, w) / area;
+    }
   }
+  return out;
 }
-async function selfieSegFallback(img) {
+function guidedFilterGray(rgbData, pFloat32, w, h, r=8, eps=1e-3){
+  // rgbData: Uint8ClampedArray (RGBA) length w*h*4
+  const N = w*h;
+  const I = new Float32Array(N);
+  for (let i=0, j=0;i<N;i++, j+=4){
+    I[i] = (0.299*rgbData[j] + 0.587*rgbData[j+1] + 0.114*rgbData[j+2]) / 255.0;
+  }
+  // normalize p to 0..1
+  const p = new Float32Array(N);
+  let pmin=Infinity, pmax=-Infinity;
+  for (let i=0;i<N;i++){ const v=pFloat32[i]; if (v<pmin) pmin=v; if (v>pmax) pmax=v; p[i]=v; }
+  const prange = (pmax - pmin) || 1;
+  for (let i=0;i<N;i++) p[i] = (p[i] - pmin) / prange;
+
+  const mean_I = _boxFilter(I, w, h, r);
+  const mean_p = _boxFilter(p, w, h, r);
+
+  const Ip = new Float32Array(N);
+  const II = new Float32Array(N);
+  for (let i=0;i<N;i++){ Ip[i] = I[i]*p[i]; II[i] = I[i]*I[i]; }
+  const mean_Ip = _boxFilter(Ip, w, h, r);
+  const mean_II = _boxFilter(II, w, h, r);
+
+  const a = new Float32Array(N);
+  const b = new Float32Array(N);
+  for (let i=0;i<N;i++){
+    const cov_Ip = mean_Ip[i] - mean_I[i]*mean_p[i];
+    const var_I = mean_II[i] - mean_I[i]*mean_I[i];
+    a[i] = cov_Ip / (var_I + eps);
+    b[i] = mean_p[i] - a[i]*mean_I[i];
+  }
+  const mean_a = _boxFilter(a, w, h, r);
+  const mean_b = _boxFilter(b, w, h, r);
+
+  const q = new Float32Array(N);
+  for (let i=0;i<N;i++) q[i] = mean_a[i]*I[i] + mean_b[i];
+
+  const out = new Float32Array(N);
+  for (let i=0;i<N;i++) out[i] = q[i]*prange + pmin;
+  return out;
+}
+
+function makeInputTensorFromImageBitmap(imgBitmap, target=320){
+  const tmp = document.createElement('canvas'); tmp.width=target; tmp.height=target; const ctx=tmp.getContext('2d'); ctx.drawImage(imgBitmap,0,0,target,target);
+  const id = ctx.getImageData(0,0,target,target).data; const data = new Float32Array(3*target*target);
+  for (let i=0;i<target*target;i++){ const r=id[i*4]/255,g=id[i*4+1]/255,b=id[i*4+2]/255; data[i]=r; data[i+target*target]=g; data[i+2*target*target]=b; }
+  return { data, dims: [1,3,target,target] };
+}
+
+async function runU2NetOnBitmap(imgBitmap){
+  // delegate to worker
+  if (!mw) throw new Error('model worker not initialized');
+  setStatus('Removing background…'); setProgress(80);
+  const res = await mw.infer(imgBitmap);
+  // res contains maskBuffer (ArrayBuffer) for 320x320
+  const buf = res.maskBuffer;
+  const arr = new Uint8ClampedArray(buf);
+  const out = new Float32Array(arr.length);
+  for (let i=0;i<arr.length;i++) out[i] = arr[i];
+  setProgress(100);
+  return out;
+}
+
+async function selfieSegFallbackBitmap(imgBitmap){
   return new Promise((resolve)=>{
-    const ss = new SelfieSegmentation({locateFile: (f)=>`https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${f}`});
+    const ss = new SelfieSegmentation({locateFile:(f)=>`https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${f}`});
     ss.setOptions({ modelSelection: 1 });
     ss.onResults((res)=>{
-      const mask = res.segmentationMask;
-      const tmp = document.createElement('canvas');
-      tmp.width = mask.width; tmp.height = mask.height;
-      tmp.getContext('2d').drawImage(mask,0,0);
-      const {data} = tmp.getContext('2d').getImageData(0,0,tmp.width,tmp.height);
-      const gray = new Float32Array(tmp.width*tmp.height);
-      for (let i=0;i<gray.length;i++){ gray[i] = data[i*4]; }
-      resolve((function resize(){return (function(src,sw,sh,dw,dh){const out = new Float32Array(dw*dh);for(let y=0;y<dh;y++){const gy=(y*(sh-1))/(dh-1);const y0=Math.floor(gy),y1=Math.min(y0+1,sh-1);const wy=gy-y0;for(let x=0;x<dw;x++){const gx=(x*(sw-1))/(dw-1);const x0=Math.floor(gx),x1=Math.min(x0+1,sw-1);const wx=gx-x0;const i00=y0*sw+x0,i01=y0*sw+x1,i10=y1*sw+x0,i11=y1*sw+x1;out[y*dw+x]=(1-wy)*((1-wx)*src[i00]+wx*src[i01])+wy*((1-wx)*src[i10]+wx*src[i11]);}}return out;})(gray,tmp.width,tmp.height,320,320);})());
+      const mask = res.segmentationMask; const tmp = document.createElement('canvas'); tmp.width=mask.width; tmp.height=mask.height; const g=tmp.getContext('2d'); g.drawImage(mask,0,0);
+      const d = g.getImageData(0,0,tmp.width,tmp.height).data; const out = new Float32Array(tmp.width*tmp.height); for (let i=0;i<out.length;i++) out[i]=d[i*4];
+      resolve(bilinearResizeGray(out,tmp.width,tmp.height,320,320));
     });
-    const c = document.createElement('canvas');
-    c.width = img.width; c.height = img.height;
-    c.getContext('2d').drawImage(img,0,0);
-    const frame = new Image();
-    frame.onload = ()=> ss.send({image: frame});
-    frame.src = c.toDataURL();
+    const c = document.createElement('canvas'); c.width=imgBitmap.width; c.height=imgBitmap.height; c.getContext('2d').drawImage(imgBitmap,0,0);
+    const frame = new Image(); frame.onload = ()=> ss.send({image: frame}); frame.src = c.toDataURL('image/png');
   });
 }
-function composite(img, alpha320, dispW, dispH) {
-  const a = (function(src,sw,sh,dw,dh){const out = new Float32Array(dw*dh);for(let y=0;y<dh;y++){const gy=(y*(sh-1))/(dh-1);const y0=Math.floor(gy),y1=Math.min(y0+1,sh-1);const wy=gy-y0;for(let x=0;x<dw;x++){const gx=(x*(sw-1))/(dw-1);const x0=Math.floor(gx),x1=Math.min(x0+1,sw-1);const wx=gx-x0;const i00=y0*sw+x0,i01=y0*sw+x1,i10=y1*sw+x0,i11=y1*sw+x1;out[y*dw+x]=(1-wy)*((1-wx)*src[i00]+wx*src[i01])+wy*((1-wx)*src[i10]+wx*src[i11]);}}return out;})(alpha320,320,320,dispW,dispH);
-  const refined = (function(alpha,w,h,threshold=10,feather=2){const out=new Uint8ClampedArray(w*h);for(let i=0;i<w*h;i++)out[i]=Math.max(0,Math.min(255,alpha[i]));if(threshold>0)for(let i=0;i<w*h;i++)out[i]=out[i]>threshold?out[i]:0;if(feather>0){const rad=feather|0,tmp=new Uint8ClampedArray(out);for(let y=0;y<h;y++)for(let x=0;x<w;x++){let sum=0,cnt=0;for(let dy=-rad;dy<=rad;dy++){const yy=y+dy;if(yy<0||yy>=h)continue;for(let dx=-rad;dx<=rad;dx++){const xx=x+dx;if(xx<0||xx>=w)continue;sum+=tmp[yy*w+xx];cnt++;}}out[y*w+x]=(sum/cnt)|0;}}return out;})(a,dispW,dispH,parseInt(els.thresh.value,10),parseInt(els.feather.value,10));
-  const ctx = els.display.getContext('2d');
-  const imgData = ctx.getImageData(0,0,dispW,dispH);
-  const out = imgData.data;
-  for (let i=0;i<dispW*dispH;i++){ out[i*4+3] = refined[i]; }
-  ctx.clearRect(0,0,dispW,dispH);
-  const transparent = els.bgTransparent.classList.contains('selected');
-  const white = els.bgWhite.classList.contains('selected');
-  if (!transparent){
-    ctx.fillStyle = white ? '#ffffff' : (els.bgColor.value || '#00000000');
-    ctx.fillRect(0,0,dispW,dispH);
+
+// utils: Otsu threshold on Uint8ClampedArray or Float32Array
+function otsuThreshold(arr){
+  // arr values 0-255
+  const hist = new Uint32Array(256); let total=0;
+  for (let i=0;i<arr.length;i++){ const v=Math.max(0,Math.min(255,Math.round(arr[i]))); hist[v]++; total++; }
+  let sum=0; for (let t=0;t<256;t++) sum += t*hist[t];
+  let sumB=0, wB=0, wF=0, varMax=0, threshold=0;
+  for (let t=0;t<256;t++){
+    wB += hist[t]; if (wB===0) continue; wF = total - wB; if (wF===0) break;
+    sumB += t*hist[t]; const mB = sumB / wB; const mF = (sum - sumB) / wF; const varBetween = wB * wF * (mB - mF) * (mB - mF);
+    if (varBetween > varMax){ varMax = varBetween; threshold = t; }
   }
-  ctx.putImageData(imgData,0,0);
+  return threshold;
 }
-async function processImage() {
-  if (!originalImageBitmap) return;
-  const {w,h} = drawToCanvas(originalImageBitmap);
-  els.modelStatus.textContent = 'Processing…';
-  try {
-    let alpha320;
-    if (session) {
-      els.modelStatus.textContent = 'Processing (U²‑Netp)…';
-      alpha320 = await runU2Net(originalImageBitmap);
-      console.info('Processed with U2Netp');
-    } else {
-      els.modelStatus.textContent = 'Processing (fallback)…';
-      alpha320 = await selfieSegFallback(originalImageBitmap);
-      console.info('Processed with selfie segmentation fallback');
+
+function percentileThreshold(arr, p=0.9){
+  // compute p-th percentile (0-1)
+  const copy = new Uint8Array(arr.length); for (let i=0;i<arr.length;i++) copy[i]=Math.max(0,Math.min(255,Math.round(arr[i])));
+  const hist = new Uint32Array(256); for (let i=0;i<copy.length;i++) hist[copy[i]]++;
+  const target = Math.round(copy.length * p); let cum=0; for (let t=0;t<256;t++){ cum += hist[t]; if (cum>=target) return t; } return 255;
+}
+
+function computeEdgeGradient(alpha, w, h){
+  // Sobel-like gradient on alpha (0-255)
+  const gx = new Float32Array(w*h); const gy = new Float32Array(w*h); const mag = new Float32Array(w*h);
+  for (let y=1;y<h-1;y++) for (let x=1;x<w-1;x++){ const i=y*w+x;
+    const a00=alpha[(y-1)*w + (x-1)], a01=alpha[(y-1)*w + x], a02=alpha[(y-1)*w + (x+1)];
+    const a10=alpha[y*w + (x-1)], a11=alpha[y*w + x], a12=alpha[y*w + (x+1)];
+    const a20=alpha[(y+1)*w + (x-1)], a21=alpha[(y+1)*w + x], a22=alpha[(y+1)*w + (x+1)];
+    const gxv = -a00 - 2*a10 - a20 + a02 + 2*a12 + a22;
+    const gyv = -a00 - 2*a01 - a02 + a20 + 2*a21 + a22;
+    gx[i]=gxv; gy[i]=gyv; mag[i]=Math.hypot(gxv,gyv);
+  }
+  return mag;
+}
+
+function adaptiveFeather(alpha, w, h){
+  const mag = computeEdgeGradient(alpha,w,h);
+  // compute 90th percentile of mag
+  const vals = []; for (let i=0;i<mag.length;i++) vals.push(Math.round(mag[i])); vals.sort((a,b)=>a-b);
+  const p90 = vals[Math.floor(vals.length*0.9)] || 0;
+  // map p90 to feather radius 0..3
+  const maxMag = vals[vals.length-1] || 1;
+  const v = Math.min(1, p90/(maxMag||1));
+  return Math.round((1 - v) * 3); // stronger edges -> smaller feather
+}
+
+function boxBlurAlpha(alpha, w, h, r){
+  if (!r) return new Uint8ClampedArray(alpha);
+  const out = new Uint8ClampedArray(w*h);
+  for (let y=0;y<h;y++) for (let x=0;x<w;x++){ let sum=0,cnt=0; for (let dy=-r;dy<=r;dy++) for (let dx=-r;dx<=r;dx++){ const sx=x+dx, sy=y+dy; if (sx<0||sy<0||sx>=w||sy>=h) continue; sum+=alpha[sy*w+sx]; cnt++; } out[y*w+x]=cnt?Math.round(sum/cnt):alpha[y*w+x]; }
+  return out;
+}
+
+function antiAliasAlpha(alpha, w, h, maxDist=3){
+  // simple distance-based anti-alias around edges
+  const isFg = new Uint8Array(w*h); for (let i=0;i<w*h;i++) isFg[i]= alpha[i]>127?1:0;
+  const dist = new Uint32Array(w*h); const inf=1e8; for (let i=0;i<w*h;i++) dist[i]=isFg[i]?0:inf;
+  for (let y=0;y<h;y++) for (let x=0;x<w;x++){ const i=y*w+x; if (x>0) dist[i]=Math.min(dist[i], dist[i-1]+1); if (y>0) dist[i]=Math.min(dist[i], dist[i-w]+1); }
+  for (let y=h-1;y>=0;y--) for (let x=w-1;x>=0;x--){ const i=y*w+x; if (x<w-1) dist[i]=Math.min(dist[i], dist[i+1]+1); if (y<h-1) dist[i]=Math.min(dist[i], dist[i+w]+1); }
+  const out=new Uint8ClampedArray(w*h);
+  for (let i=0;i<w*h;i++){ if (isFg[i]) out[i]=255; else if (dist[i]>maxDist) out[i]=0; else out[i]=Math.round(255*(1 - dist[i]/(maxDist+1))); }
+  return out;
+}
+
+function deSpill(canvas, alpha){
+  // mild de-spill: sample background around contour and desaturate pixels near contour
+  const w=canvas.width, h=canvas.height; const ctx=canvas.getContext('2d'); const img=ctx.getImageData(0,0,w,h); const data=img.data;
+  // find contour pixels
+  const N=w*h; const contour = new Uint8Array(N);
+  for (let y=1;y<h-1;y++) for (let x=1;x<w-1;x++){ const i=y*w+x; if (alpha[i]>200) continue; let hasFg=false; for (let dy=-1;dy<=1;dy++) for (let dx=-1;dx<=1;dx++){ if (dy===0&&dx===0) continue; if (alpha[(y+dy)*w + (x+dx)]>200) hasFg=true; } if (hasFg) contour[i]=1; }
+  // process contour: desaturate towards complementary of local bg average
+  for (let i=0;i<N;i++){
+    if (!contour[i]) continue;
+    const x = i % w, y = Math.floor(i / w);
+    // sample small ring outside
+    let sr=0,sg=0,sb=0,cnt=0; const radius=3;
+    for (let dy=-radius;dy<=radius;dy++) for (let dx=-radius;dx<=radius;dx++){ const sx=x+dx, sy=y+dy; if (sx<0||sy<0||sx>=w||sy>=h) continue; const si=sy*w+sx; if (alpha[si]>220) continue; const gi=si*4; sr+=data[gi]; sg+=data[gi+1]; sb+=data[gi+2]; cnt++; }
+    if (!cnt) continue; sr/=cnt; sg/=cnt; sb/=cnt;
+    const pi=i*4; const fr=data[pi], fg=data[pi+1], fb=data[pi+2];
+    // compute simple desaturation towards bg
+    const a = alpha[i]/255; const desat = Math.min(0.6, (1-a)*0.6);
+    // convert to hsv and reduce saturation
+    const [hH,hS,hV] = rgbToHsv(fr,fg,fb); const newS = Math.max(0, hS * (1 - desat)); const [nr,ng,nb] = hsvToRgb(hH, newS, hV);
+    data[pi]=nr; data[pi+1]=ng; data[pi+2]=nb;
+  }
+  ctx.putImageData(img,0,0);
+}
+
+function rgbToHsv(r,g,b){ r/=255; g/=255; b/=255; const max=Math.max(r,g,b), min=Math.min(r,g,b); const d=max-min; let h=0; if (d===0) h=0; else if (max===r) h = (60*((g-b)/d)+360)%360; else if (max===g) h = (60*((b-r)/d)+120)%360; else h=(60*((r-g)/d)+240)%360; const s = max===0?0:d/max; const v = max; return [h,s,v]; }
+function hsvToRgb(h,s,v){ const c = v*s; const x = c*(1 - Math.abs((h/60)%2 -1)); const m=v-c; let r=0,g=0,b=0; if (0<=h&&h<60){ r=c; g=x; b=0; } else if (60<=h&&h<120){ r=x; g=c; b=0; } else if (120<=h&&h<180){ r=0; g=c; b=x; } else if (180<=h&&h<240){ r=0; g=x; b=c; } else if (240<=h&&h<300){ r=x; g=0; b=c; } else { r=c; g=0; b=x; } return [Math.round((r+m)*255), Math.round((g+m)*255), Math.round((b+m)*255)]; }
+
+function compositeToCanvas(canvas, rgbaData, alpha, w, h){
+  const ctx=canvas.getContext('2d'); const img = ctx.getImageData(0,0,canvas.width,canvas.height); // assume canvas already has image drawn
+  // write corrected colors and alpha
+  for (let i=0;i<w*h;i++){ const pi=i*4; img.data[pi]=rgbaData[pi]; img.data[pi+1]=rgbaData[pi+1]; img.data[pi+2]=rgbaData[pi+2]; img.data[pi+3]=alpha[i]; }
+  ctx.putImageData(img,0,0);
+}
+
+// expose runAuto
+window.runAuto = async function runAuto(file){
+  if (!file) return; currentFile = file;
+  // reset UI
+  if (els.download) els.download.disabled = true;
+  if (els.resultPreview) els.resultPreview.style.display='none';
+  showSpinner();
+  try{
+    setStatus('Loading model…'); setProgress(10);
+    const blobURL = URL.createObjectURL(file);
+    const imgBitmap = await createImageBitmap(await (await fetch(blobURL)).blob());
+    URL.revokeObjectURL(blobURL);
+    const canvas = els.displayCanvas; const ctx = canvas.getContext('2d');
+    // scale to max 1600 width
+    const maxW = Math.min(1600, imgBitmap.width); const scale = Math.min(maxW / imgBitmap.width, 1);
+    const w = Math.round(imgBitmap.width * scale); const h = Math.round(imgBitmap.height * scale);
+    canvas.width = w; canvas.height = h; ctx.clearRect(0,0,w,h); ctx.drawImage(imgBitmap,0,0,w,h);
+
+    // load model
+    let useFallback = false;
+    if (els.useFallback && els.useFallback.checked) useFallback = true;
+    if (!useFallback){ try { await loadModelOnce(); } catch(e){ console.warn('model load failed, will fallback'); appendLog('⚠️ model load failed: '+(e && e.message? e.message : e)); useFallback = true; } }
+
+    // give a mid progress update
+    appendLog('📁 image loaded, starting analysis'); setProgress(75);
+
+    // inference
+    let raw320;
+    if (!useFallback && session){ raw320 = await runU2NetOnBitmap(imgBitmap); }
+    else { setStatus('Analyzing…'); setProgress(80); raw320 = await selfieSegFallbackBitmap(imgBitmap); }
+
+    // normalize raw to 0-255
+    const rawU8 = new Uint8ClampedArray(320*320);
+    let min=Infinity,max=-Infinity; for (let i=0;i<raw320.length;i++){ const v=raw320[i]; if (v<min) min=v; if (v>max) max=v; }
+    const range = (max-min) || 1; for (let i=0;i<raw320.length;i++) rawU8[i]=Math.max(0,Math.min(255,Math.round((raw320[i]-min)/range*255)));
+
+    // resize to canvas
+    let alphaResizedF = bilinearResizeGray(rawU8,320,320,w,h);
+    // guided filter refinement at output size using canvas RGB as guidance
+    try{
+      const imgGuidance = ctx.getImageData(0,0,w,h).data;
+      alphaResizedF = guidedFilterGray(imgGuidance, alphaResizedF, w, h, 8, 1e-3);
+      appendLog('🧩 guided filter applied');
+    }catch(e){
+      appendLog('⚠️ guided filter failed: '+(e && e.message? e.message : e));
     }
-    composite(originalImageBitmap, alpha320, w, h);
-    els.modelStatus.textContent = session ? 'Done (U²‑Netp)' : 'Done (fallback: people only)';
-  } catch (e) {
-    console.error(e);
-    els.modelStatus.textContent = 'Error during segmentation';
-  }
+    const alphaResized = new Uint8ClampedArray(w*h); for (let i=0;i<w*h;i++) alphaResized[i]=Math.max(0,Math.min(255,Math.round(alphaResizedF[i])));
+
+    // threshold: try Otsu, fallback to 90th percentile on edge histogram
+    let thresh = otsuThreshold(alphaResized);
+    if (!thresh || thresh<5){ thresh = percentileThreshold(alphaResized, 0.9); }
+    for (let i=0;i<w*h;i++) alphaResized[i] = alphaResized[i] > thresh ? alphaResized[i] : 0;
+
+    // adaptive feather
+    const feather = adaptiveFeather(alphaResized, w, h);
+    const feathered = boxBlurAlpha(alphaResized, w, h, feather);
+
+    // anti-alias
+    const aa = antiAliasAlpha(feathered, w, h, Math.max(1, feather));
+
+    // mild de-spill/color cleanup
+    deSpill(canvas, aa);
+
+    // composite: write alpha into canvas imageData
+    const imgData = ctx.getImageData(0,0,w,h);
+    for (let i=0;i<w*h;i++){ imgData.data[i*4+3] = aa[i]; }
+    ctx.putImageData(imgData,0,0);
+
+    // show preview and enable download
+    if (els.resultPreview) els.resultPreview.style.display='block';
+    if (els.download) els.download.disabled = false;
+    setStatus('Done ✓'); setProgress(100);
+    appendLog('✅ processing complete');
+    showToast('Background removed');
+  } catch (err){ console.error(err); appendLog('❌ processing error: '+(err && err.stack? err.stack : err && err.message? err.message : err)); setStatus('Error ⚠️'); setProgress(0); showToast('Processing error'); }
+  finally{ hideSpinner(); }
+};
+
+// UI wiring: drag & drop, file input, replace, download, keyboard
+function setupSimpleUI(){
+  if (els.drop){ els.drop.addEventListener('dragover', e=>{ e.preventDefault(); els.drop.classList.add('hover'); }); els.drop.addEventListener('dragleave', ()=>els.drop.classList.remove('hover'));
+    els.drop.addEventListener('drop', e=>{ e.preventDefault(); els.drop.classList.remove('hover'); const f = e.dataTransfer.files?.[0]; if (f) { if (els.file) els.file.value=''; window.runAuto(f); } }); }
+  if (els.file){ els.file.addEventListener('change', ()=>{ const f = els.file.files?.[0]; if (f) window.runAuto(f); }); }
+  if (els.replace){ els.replace.addEventListener('click', ()=>{ if (els.file) els.file.click(); }); }
+  if (els.download){ els.download.addEventListener('click', ()=>{ const link=document.createElement('a'); link.download='background-removed.png'; link.href = els.displayCanvas.toDataURL('image/png'); link.click(); }); }
+  window.addEventListener('keydown', (e)=>{ if (e.key==='d' || e.key==='D'){ if (!e.target || e.target.tagName==='BODY') { e.preventDefault(); if (!els.download.disabled) els.download.click(); } } if (e.key==='r' || e.key==='R'){ if (els.file) els.file.click(); } });
 }
-function initUI() {
-  function selectBg(which){
-    [els.bgTransparent, els.bgWhite].forEach(el=>el.classList.remove('selected'));
-    if (which==='transparent') els.bgTransparent.classList.add('selected');
-    if (which==='white') els.bgWhite.classList.add('selected');
-    if (originalImageBitmap) processImage();
-  }
-  els.bgTransparent.addEventListener('click', ()=>selectBg('transparent'));
-  els.bgWhite.addEventListener('click', ()=>selectBg('white'));
-  els.bgColor.addEventListener('input', ()=>{ [els.bgTransparent, els.bgWhite].forEach(el=>el.classList.remove('selected')); processImage();});
-  els.thresh.addEventListener('input', ()=> processImage());
-  els.feather.addEventListener('input', ()=> processImage());
-  els.download.addEventListener('click', ()=>{
-    const link = document.createElement('a');
-    link.download = 'background-removed.png';
-    els.display.toBlob((blob)=>{
-      const url = URL.createObjectURL(blob);
-      link.href = url; document.body.appendChild(link); link.click();
-      setTimeout(()=>{ URL.revokeObjectURL(url); link.remove(); }, 1000);
-    }, 'image/png');
-  });
-  els.reset.addEventListener('click', ()=> window.location.reload());
-}
-(async function main(){
-  // load scripts from footer
-  setupDnD();
-  initUI();
-  await loadModel();
-})();
+
+// initialize
+setupSimpleUI();
+
