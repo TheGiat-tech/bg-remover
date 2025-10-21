@@ -112,10 +112,19 @@
 <div class="footer">
   <small>© 2025 Background Remover • Works locally in your browser. No uploads.</small>
 </div>
-<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort.min.js"></script>
+<!-- set ORT wasm path to local vendor folder -->
+<script>
+  window.ort = window.ort || {};
+  window.ort.env = window.ort.env || {};
+  window.ort.env.wasm = window.ort.env.wasm || {};
+  window.ort.env.wasm.wasmPaths = '/js/vendor/ort/';
+</script>
+<!-- load local ONNX Runtime Web -->
+<script src="/js/vendor/ort/ort.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js"></script>
 <script src="/js/banner.js"></script>
 
-<script type="module" src="/js/app.js?v=20251020"></script>
+<!-- load the app after ORT; cache-bust with build hash -->
+<script defer src="/js/app.js?v=20251021"></script>
 </body>
 </html>
