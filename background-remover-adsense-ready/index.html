@@ -6,7 +6,7 @@
   <title>Background Remover — Free Online Tool</title>
   <meta name="description" content="Remove image backgrounds 100% in your browser. No uploads, no signup. Free, fast, and private." />
   <link rel="icon" href="/assets/favicon.ico" />
-  <link rel="stylesheet" href="/css/style.css" />
+  <link rel="stylesheet" href="/css/style.css?v=20251021" />
   <meta property="og:title" content="Background Remover — Free Online Tool" />
   <meta property="og:description" content="Remove image backgrounds 100% in your browser. No uploads, no signup." />
   <meta property="og:type" content="website" />
@@ -121,8 +121,12 @@
 </script>
 <!-- load local ONNX Runtime Web -->
 <script src="/js/vendor/ort/ort.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js"></script>
 <script src="/js/banner.js"></script>
+
+<!-- preload possible ORT WASM files for faster startup -->
+<link rel="preload" href="/js/vendor/ort/ort-wasm-simd-threaded.wasm" as="fetch" type="application/wasm" crossorigin>
+<link rel="preload" href="/js/vendor/ort/ort-wasm-simd-threaded.asyncify.wasm" as="fetch" type="application/wasm" crossorigin>
+<link rel="preload" href="/js/vendor/ort/ort-wasm-simd-threaded.jsep.wasm" as="fetch" type="application/wasm" crossorigin>
 
 <!-- load the app after ORT; cache-bust with build hash -->
 <script defer src="/js/app.js?v=20251021"></script>
