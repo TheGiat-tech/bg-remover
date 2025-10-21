@@ -6,6 +6,13 @@
 */
 import { ModelWorkerClient } from './modelWorkerClient.js';
 
+// Ensure ORT loads WASM from the local vendor folder when available
+if (typeof ort !== 'undefined'){
+  ort.env = ort.env || {};
+  ort.env.wasm = ort.env.wasm || {};
+  ort.env.wasm.wasmPaths = '/js/vendor/ort/';
+}
+
 const MODEL_URL = '/models/u2net.onnx';
 const MODEL_URL_P = '/models/u2netp.onnx';
 // prefer the lightweight U2‑NetP shipped with the site (fast, client-friendly)
@@ -94,7 +101,7 @@ async function loadModelOnce(){
   const bytes = await ensureU2NetpModel();
   // create ONNX Runtime session (prefer webgl then wasm)
   try{
-    if (typeof ort !== 'undefined' && ort.env && ort.env.wasm){ ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/"; ort.env.wasm.proxy = true; }
+    if (typeof ort !== 'undefined' && ort.env && ort.env.wasm){ ort.env.wasm.wasmPaths = '/js/vendor/ort/'; }
     const sess = await ort.InferenceSession.create(bytes, { executionProviders: ['webgl','wasm'] });
     window.segModel = sess; session = sess; appendLog('🧠 session ready (u2netp)'); setProgress(70);
     return session;
@@ -113,15 +120,31 @@ async function ensureU2NetpModel(){
     const arrayBuffer = await response.arrayBuffer();
     return new Uint8Array(arrayBuffer);
   }catch(err){
-    appendLog('⬇️ Downloading model from remote (first-run)...');
-    const url = 'https://huggingface.co/onnx-community/U-2-Net/resolve/main/u2netp.onnx';
-    const response = await fetch(url);
-    if (!response.ok) throw new Error('remote model fetch failed '+response.status);
-    const blob = await response.blob();
-    const arrayBuffer = await blob.arrayBuffer();
-    try{ await saveModelToIndexedDB('u2netp.onnx', blob); appendLog('✅ Model downloaded and cached in IndexedDB.'); }catch(e){ appendLog('⚠️ failed to cache model: '+(e && e.message? e.message : e)); }
-    return new Uint8Array(arrayBuffer);
+    // If local model missing, rethrow — we prefer not to auto-download in this local-first setup
+    appendLog('❌ local model not found: '+(err && err.message? err.message : err));
+    throw err;
   }
+}
+
+// --- Dynamic MediaPipe loader for optional fallback -------------------
+async function ensureMediaPipeLoaded(){
+  if (window.SelfieSegmentation) return;
+  return new Promise((resolve, reject)=>{
+    const script = document.createElement('script');
+    script.src = 'https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js';
+    script.async = true;
+    script.onload = ()=>resolve();
+    script.onerror = (e)=>reject(e);
+    document.head.appendChild(script);
+  });
+}
+
+async function maybeRunFallback(imgBitmap){
+  const useFallback = document.getElementById('useFallback')?.checked;
+  if (!useFallback) return null;
+  await ensureMediaPipeLoaded();
+  // run MediaPipe segmentation only when explicitly enabled
+  return await selfieSegFallbackBitmap(imgBitmap);
 }
 
 // Load model bytes and create an ONNX Runtime session with preferred providers
