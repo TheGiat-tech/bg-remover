@@ -19,6 +19,7 @@ a{color:var(--brand);text-decoration:none}
 .dz-title{font-size:1.15rem;margin:.5rem 0}
 .dz-sub{opacity:.7;margin:.25rem 0}
 .dz-note{opacity:.55;font-size:.9rem;margin-top:.75rem}
+input.visually-hidden-input{position:absolute;width:1px;height:1px;padding:0;margin:-1px;border:0;clip:rect(0 0 0 0);clip-path:inset(50%);overflow:hidden;white-space:nowrap}
 button{border:none;border-radius:10px;padding:.55rem .9rem;background:var(--brand);color:white;font-weight:600;cursor:pointer}
 button.ghost{background:transparent;border:1px solid var(--border)}
 .controls{margin-top:1rem;border-radius:12px;padding:1rem;background:var(--card);border:1px solid var(--border)}
