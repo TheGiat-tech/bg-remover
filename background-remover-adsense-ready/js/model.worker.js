@@ -5,7 +5,12 @@
    - run inference on ImageBitmap and return mask buffer (Uint8ClampedArray.buffer)
 */
 
-importScripts('https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort.min.js');
+const ortScript = new URL('./vendor/ort/ort.min.js', self.location.href);
+importScripts(ortScript.href);
+if (self.ort && self.ort.env && self.ort.env.wasm){
+  const wasmBase = new URL('./vendor/ort/', self.location.href);
+  self.ort.env.wasm.wasmPaths = wasmBase.href;
+}
 
 // IndexedDB helpers
 function openDB(){

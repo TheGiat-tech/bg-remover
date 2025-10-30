@@ -68,7 +68,7 @@
     <script>(adsbygoogle=window.adsbygoogle||[]).push({});</script>
   </div>
 
-  <section class="uploader card" id="dropzone">
+  <section class="uploader card" id="dropzone" role="button" tabindex="0" aria-label="Upload image">
     <input id="fileInput" type="file" accept="image/*" hidden />
     <div class="dz-inner">
       <p class="dz-title">Drop an image here</p>
@@ -129,6 +129,6 @@
 <link rel="preload" href="/js/vendor/ort/ort-wasm-simd-threaded.jsep.wasm" as="fetch" type="application/wasm" crossorigin>
 
 <!-- load the app after ORT; cache-bust with build hash -->
-<script defer src="/js/app.js?v=20251021"></script>
+<script type="module" src="/js/app.js?v=20251021"></script>
 </body>
 </html>
