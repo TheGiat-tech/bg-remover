@@ -13,11 +13,8 @@ if (typeof ort !== 'undefined'){
   ort.env.wasm.wasmPaths = '/js/vendor/ort/';
 }
 
-const MODEL_URL = '/models/u2net.onnx';
-const MODEL_URL_P = '/models/u2netp.onnx';
 // prefer the lightweight U2‑NetP shipped with the site (fast, client-friendly)
-const modelPath = "/models/u2netp.onnx";
-console.log('Model path:', modelPath);
+const modelPath = '/models/u2netp.onnx';
 
 const els = {
   drop: document.getElementById('dropzone'),
@@ -33,6 +30,8 @@ const els = {
 
 let session = null; // ONNX session placeholder (worker handles inference)
 let mw = null; // ModelWorkerClient
+let workerReady = false;
+let workerEventsBound = false;
 let currentFile = null;
 
 // --- Status / Log API --------------------------------------------------
@@ -63,56 +62,46 @@ function showToast(msg, timeout=2000){
   t.textContent = msg; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'), timeout);
 }
 
-async function fetchModel(url){
-  const res = await fetch(url, { mode: 'cors' });
-  if (!res.ok) throw new Error('model fetch failed '+res.status);
-  const ab = await res.arrayBuffer();
-  return ab;
-}
-
-async function loadModel(name) {
-  // load model bytes from ./models/{name}
-  const path = `./models/${name}`;
-  const res = await fetch(path, { mode: 'cors' });
-  if (!res.ok) throw new Error(`fetch ${path} failed ${res.status}`);
-  const ab = await res.arrayBuffer();
-  const bytes = new Uint8Array(ab);
-  const sess = await ort.InferenceSession.create(bytes, { executionProviders: ['wasm','webgl','webgpu'] });
-  window.segModel = sess;
-  session = sess;
-  return sess;
-}
-
 async function loadModelOnce(){
-  if (session) return session;
-  // try main then fallback
-  // initialize worker client
+  if (session && workerReady) return session;
   if (!mw) mw = new ModelWorkerClient();
-  // wire worker events for status/progress/logs (idempotent)
-  mw.on('log', (m)=>{ appendLog(m); });
-  mw.on('load:start', ({name})=>{ addStatus('Loading model…'); setProgress(10); appendLog('⏳ loading '+name); });
-  mw.on('load:done', ({name})=>{ appendLog('✅ model from IndexedDB or cache: '+name); setProgress(40); });
-  mw.on('load:error', ({name, error})=>{ appendLog('❌ model load failed: '+name+' '+ (error && error.message ? error.message : error)); setStatus('Error ⚠️'); setProgress(0); });
-  mw.on('infer:start', ()=>{ setStatus('Removing background…'); setProgress(90); appendLog('▶️ inference started'); });
-  mw.on('infer:done', ()=>{ appendLog('✅ inference finished'); setProgress(95); });
-  mw.on('infer:error', ({error})=>{ appendLog('❌ inference error: '+(error && error.message? error.message : error)); setStatus('Error ⚠️'); setProgress(0); });
-  // ensure U2‑NetP model is present locally (or cached in IndexedDB)
+  if (!workerEventsBound){
+    mw.on('log', (m)=>{ appendLog(m); });
+    mw.on('load:start', ({name})=>{ addStatus('Loading model…'); setProgress(10); appendLog('⏳ loading '+name); });
+    mw.on('load:done', ({name})=>{ appendLog('✅ model from IndexedDB or cache: '+name); setProgress(40); });
+    mw.on('load:error', ({name, error})=>{ appendLog('❌ model load failed: '+name+' '+ (error && error.message ? error.message : error)); setStatus('Error ⚠️'); setProgress(0); });
+    mw.on('infer:start', ()=>{ setStatus('Removing background…'); setProgress(90); appendLog('▶️ inference started'); });
+    mw.on('infer:done', ()=>{ appendLog('✅ inference finished'); setProgress(95); });
+    mw.on('infer:error', ({error})=>{ appendLog('❌ inference error: '+(error && error.message? error.message : error)); setStatus('Error ⚠️'); setProgress(0); });
+    workerEventsBound = true;
+  }
   addStatus('Ensuring U2‑NetP model…'); setProgress(15);
   const bytes = await ensureU2NetpModel();
-  // create ONNX Runtime session (prefer webgl then wasm)
   try{
-    if (typeof ort !== 'undefined' && ort.env && ort.env.wasm){ ort.env.wasm.wasmPaths = '/js/vendor/ort/'; }
-    const sess = await ort.InferenceSession.create(bytes, { executionProviders: ['webgl','wasm'] });
-    window.segModel = sess; session = sess; appendLog('🧠 session ready (u2netp)'); setProgress(70);
+    if (!session){
+      if (typeof ort !== 'undefined' && ort.env && ort.env.wasm){ ort.env.wasm.wasmPaths = '/js/vendor/ort/'; }
+      const sess = await ort.InferenceSession.create(bytes, { executionProviders: ['webgl','wasm'] });
+      window.segModel = sess;
+      session = sess;
+      appendLog('🧠 session ready (u2netp)');
+    }
+    if (!workerReady){
+      await mw.load({ name: 'u2netp.onnx', url: modelPath });
+      workerReady = true;
+      appendLog('🤖 worker ready (u2netp)');
+    }
+    setProgress(70);
     return session;
   }catch(err){
-    appendLog('❌ Failed to create session from u2netp bytes: '+(err && err.message? err.message : err));
-    session = null; throw err;
+    appendLog('❌ Failed to initialise segmentation: '+(err && err.message? err.message : err));
+    session = null;
+    workerReady = false;
+    throw err;
   }
+}
 
 // Ensure u2netp.onnx is available locally (/models/u2netp.onnx) or cached in IndexedDB
 async function ensureU2NetpModel(){
-  const mp = modelPath; // keep backward compat
   try{
     const response = await fetch(modelPath, { cache: 'force-cache' });
     if (!response.ok) throw new Error('Missing local model');
@@ -136,88 +125,6 @@ async function ensureMediaPipeLoaded(){
     script.onload = ()=>resolve();
     script.onerror = (e)=>reject(e);
     document.head.appendChild(script);
-  });
-}
-
-async function maybeRunFallback(imgBitmap){
-  const useFallback = document.getElementById('useFallback')?.checked;
-  if (!useFallback) return null;
-  await ensureMediaPipeLoaded();
-  // run MediaPipe segmentation only when explicitly enabled
-  return await selfieSegFallbackBitmap(imgBitmap);
-}
-
-// Load model bytes and create an ONNX Runtime session with preferred providers
-async function loadSegModel(){
-  console.log('🔍 Loading model from:', modelPath);
-  setStatus('Loading model…'); setProgress(5);
-  const resp = await fetch(modelPath, { cache: 'force-cache' });
-  if (!resp.ok) throw new Error(`Fetch failed ${resp.status}`);
-  const buf = await resp.arrayBuffer();
-  const bytes = new Uint8Array(buf);
-
-  // prefer WebGL then WASM
-  const tryCreate = async (providers) => {
-    try{
-      if (typeof ort !== 'undefined' && ort.env && ort.env.wasm){
-        ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/";
-        ort.env.wasm.proxy = true;
-      }
-      console.log('🧠 Creating ORT session with providers:', providers);
-      const s = await ort.InferenceSession.create(bytes, { executionProviders: providers });
-      return s;
-    }catch(e){ throw e; }
-  };
-
-  let sess = null;
-  try{
-    sess = await tryCreate(['webgl','wasm']);
-  }catch(e1){
-    console.warn('WebGL+WASM failed, trying WASM only:', e1);
-    sess = await tryCreate(['wasm']);
-  }
-  console.log('✅ ONNX session ready', 'inputs:', sess.inputNames, 'outputs:', sess.outputNames);
-  setStatus('Model loaded ✓'); setProgress(60);
-  window.segModel = sess; session = sess;
-  return sess;
-}
-
-// Run segmentation using actual input/output names from the session
-async function runSegmentation(sess, imageBitmap){
-  // prepare tensor from ImageBitmap
-  const inp = makeInputTensorFromImageBitmap(imageBitmap, 320); // { data, dims }
-  const tensor = new ort.Tensor('float32', inp.data, inp.dims);
-  const inputName = sess.inputNames[0];
-  const outputName = sess.outputNames[0];
-  const results = await sess.run({ [inputName]: tensor });
-  const out = results[outputName];
-  // out.data is Float32Array likely shape [1,1,320,320] or [1,320,320]
-  // flatten to single-channel float array
-  let arr = out.data;
-  if (arr instanceof Float32Array === false) arr = new Float32Array(arr);
-  // normalize to 0..255 if necessary (assume arr values 0..1 or 0..255)
-  // create Float32Array of length 320*320
-  const len = arr.length;
-  const outF = new Float32Array(len);
-  // detect range
-  let min=Infinity, max=-Infinity; for (let i=0;i<len;i++){ const v=arr[i]; if (v<min) min=v; if (v>max) max=v; }
-  const range = (max - min) || 1;
-  for (let i=0;i<len;i++) outF[i] = (arr[i]-min)/range * 255.0;
-  return { data: outF, width: inp.dims[2] || 320, height: inp.dims[3] || 320 };
-}
-
-async function saveModelToIndexedDB(name, blob){
-  return new Promise((resolve, reject)=>{
-    const request = indexedDB.open('modelsDB', 1);
-    request.onupgradeneeded = e => { const db = e.target.result; if (!db.objectStoreNames.contains('models')) db.createObjectStore('models'); };
-    request.onsuccess = e => {
-      const db = e.target.result;
-      const tx = db.transaction('models', 'readwrite');
-      tx.objectStore('models').put(blob, name);
-      tx.oncomplete = ()=> resolve(true);
-      tx.onerror = (ev)=> reject(ev && ev.target && ev.target.error ? ev.target.error : new Error('idb-put-failed'));
-    };
-    request.onerror = (ev)=> reject(ev && ev.target && ev.target.error ? ev.target.error : new Error('idb-open-failed'));
   });
 }
 
@@ -311,7 +218,7 @@ function makeInputTensorFromImageBitmap(imgBitmap, target=320){
 
 async function runU2NetOnBitmap(imgBitmap){
   // delegate to worker
-  if (!mw) throw new Error('model worker not initialized');
+  if (!mw || !workerReady) throw new Error('model worker not initialized');
   setStatus('Removing background…'); setProgress(80);
   const res = await mw.infer(imgBitmap);
   // res contains maskBuffer (ArrayBuffer) for 320x320
@@ -324,6 +231,7 @@ async function runU2NetOnBitmap(imgBitmap){
 }
 
 async function selfieSegFallbackBitmap(imgBitmap){
+  await ensureMediaPipeLoaded();
   return new Promise((resolve)=>{
     const ss = new SelfieSegmentation({locateFile:(f)=>`https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${f}`});
     ss.setOptions({ modelSelection: 1 });
@@ -445,9 +353,7 @@ window.runAuto = async function runAuto(file){
   showSpinner();
   try{
     setStatus('Loading model…'); setProgress(10);
-    const blobURL = URL.createObjectURL(file);
-    const imgBitmap = await createImageBitmap(await (await fetch(blobURL)).blob());
-    URL.revokeObjectURL(blobURL);
+    const imgBitmap = await createImageBitmap(file);
     const canvas = els.displayCanvas; const ctx = canvas.getContext('2d');
     // scale to max 1600 width
     const maxW = Math.min(1600, imgBitmap.width); const scale = Math.min(maxW / imgBitmap.width, 1);
@@ -464,7 +370,7 @@ window.runAuto = async function runAuto(file){
 
     // inference
     let raw320;
-    if (!useFallback && session){ raw320 = await runU2NetOnBitmap(imgBitmap); }
+    if (!useFallback && session && workerReady){ raw320 = await runU2NetOnBitmap(imgBitmap); }
     else { setStatus('Analyzing…'); setProgress(80); raw320 = await selfieSegFallbackBitmap(imgBitmap); }
 
     // normalize raw to 0-255
