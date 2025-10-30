@@ -1,7 +1,12 @@
 // modelWorkerClient.js - client wrapper for model.worker.js
 export class ModelWorkerClient {
   constructor(){
-    this.w = new Worker('/js/model.worker.js');
+    const workerUrl = new URL('./model.worker.js', import.meta.url);
+    try {
+      this.w = new Worker(workerUrl, { type: 'classic' });
+    } catch (err){
+      this.w = new Worker(workerUrl);
+    }
     this.req = 0;
     this.waiters = new Map();
     this.eventListeners = new Map();
